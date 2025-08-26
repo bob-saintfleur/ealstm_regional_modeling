@@ -10,8 +10,8 @@ see <https://opensource.org/licenses/Apache-2.0>
 """
 
 from pathlib import PosixPath
-from typing import List, Tuple
-
+from typing import List, Tuple, Dict
+from datetime import timedelta
 import h5py
 import numpy as np
 import pandas as pd
@@ -60,7 +60,9 @@ class CamelsTXT(Dataset):
                  attribute_means: pd.Series = None,
                  attribute_stds: pd.Series = None,
                  concat_static: bool = False,
-                 db_path: str = None):
+                 db_path: str = None,
+                 preset_xy_tensor: tuple = None):
+
         self.camels_root = camels_root
         self.basin = basin
         self.seq_length = seq_length
@@ -71,6 +73,7 @@ class CamelsTXT(Dataset):
         self.attribute_stds = attribute_stds
         self.concat_static = concat_static
         self.db_path = db_path
+        self.preset_xy_tensor = preset_xy_tensor
 
         # placeholder to store std of discharge, used for rescaling losses during training
         self.q_std = None
@@ -80,7 +83,10 @@ class CamelsTXT(Dataset):
         self.period_end = None
         self.attribute_names = None
 
-        self.x, self.y = self._load_data()
+        if self.preset_xy_tensor is not None:
+            self.x, self.y = self.preset_xy_tensor
+        else:
+            self.x, self.y = self._load_data()
 
         if self.with_attributes:
             self.attributes = self._load_attributes()
@@ -161,6 +167,131 @@ class CamelsTXT(Dataset):
         # store feature as PyTorch Tensor
         attributes = df.loc[df.index == self.basin].values
         return torch.from_numpy(attributes.astype(np.float32))
+
+
+class GetClimSubset:
+    """PyTorch data set to work with the raw text files in the CAMELS data set.
+
+    Parameters
+    ----------
+    camels_root : PosixPath
+        Path to the main directory of the CAMELS data set
+    basin : str
+        8-digit usgs-id of the basin
+    dates : List
+        Start and end date of the period.
+    is_train : bool
+        If True, discharge observations are normalized and invalid discharge samples are removed
+    seq_length : int, optional
+        Length of the input sequence, by default 270
+    with_attributes : bool, optional
+        If True, loads and returns addtionaly attributes, by default False
+    attribute_means : pd.Series, optional
+        Means of catchment characteristics, used to normalize during inference, by default None
+    attribute_stds : pd.Series, optional
+        Stds of catchment characteristics, used to normalize during inference,, by default None
+    concat_static : bool, optional
+        If true, adds catchment characteristics at each time step to the meteorological forcing
+        input data, by default False
+    db_path : str, optional
+        Path to sqlite3 database file, containing the catchment characteristics, by default None
+    """
+
+    def __init__(self,
+                 camels_root: PosixPath,
+                 basin: str,
+                 dates: List,
+                 is_train: bool,
+                 is_clim: bool = False,
+                 seq_length: int = 270,
+                 ref_date: str = None,
+                 hp=None,
+                 with_attributes: bool = False,
+                 attribute_means: pd.Series = None,
+                 attribute_stds: pd.Series = None,
+                 concat_static: bool = False,
+                 db_path: str = None):
+        self.camels_root = camels_root
+        self.basin = basin
+        self.seq_length = seq_length
+        self.is_train = is_train
+        self.is_clim = is_clim
+        self.dates = dates
+        self.with_attributes = with_attributes
+        self.attribute_means = attribute_means
+        self.attribute_stds = attribute_stds
+        self.concat_static = concat_static
+        self.db_path = db_path
+        self.hp = hp
+        self.ref_date = pd.to_datetime(ref_date)
+
+        # placeholder to store std of discharge, used for rescaling losses during training
+        self.q_std = None
+
+        # placeholder to store start and end date of entire period (incl warmup)
+        self.period_start = None
+        self.period_end = None
+        self.full_range = None
+        self.attribute_names = None
+
+        if self.hp is not None:
+            self.clim_data = self._load_clim_members()
+
+    def _load_clim_members(self, year_min: int = 1990, year_max: int = 2008) \
+            -> Dict[str, Tuple[torch.Tensor, torch.Tensor]]:
+        """Load input and output data from text files."""
+        df, area = load_forcing(self.camels_root, self.basin)
+        year_min, year_max = max(df.index.year.min(), year_min), min(df.index.year.max(), year_max)
+        df['QObs(mm/d)'] = load_discharge(self.camels_root, self.basin, area)
+
+        # we use (seq_len) time steps before start for warmup
+        start_date = self.ref_date - pd.DateOffset(days=self.seq_length - 1)
+        end_date = self.ref_date
+        hist_range = pd.date_range(start_date, end_date, freq='D')
+
+        # we use (hp) time steps after the ref date
+        start_date_hp = self.ref_date + timedelta(days=1)
+        end_date_hp = start_date_hp + timedelta(days=self.hp - 1)
+        hp_range = pd.date_range(start_date_hp, end_date_hp, freq='D')
+
+        if (hp_range.strftime("%m%d") == "0229").sum() != 0:
+            hp_range = hp_range + pd.DateOffset(days=1)
+            hp_range = hp_range[hp_range.strftime("%m%d") != "0229"]
+
+        self.full_range = hist_range.append(hp_range)
+
+        df_hist = df.loc[hist_range, :]
+        df_hp_ref = df.loc[hp_range,:]
+
+        self.period_start = start_date
+        self.period_end = end_date_hp
+
+        all_member = {}
+
+        for i, yr in enumerate(range(year_min, year_max)):
+            k = yr - hp_range[0].year
+            hp_range_ = hp_range + pd.DateOffset(years=k)
+            df_mbr = df.loc[hp_range_]
+            df_mbr.index = hp_range
+            df_mbr = pd.concat([df_hist, df_mbr], axis=0)
+
+            # use all meteorological variables as inputs
+            x = np.array([
+                df_mbr['prcp(mm/day)'].values, df_mbr['srad(W/m2)'].values, df_mbr['tmax(C)'].values,
+                df_mbr['tmin(C)'].values, df_mbr['vp(Pa)'].values]).T
+            y = np.array([df_mbr['QObs(mm/d)'].values]).T
+
+            # normalize data, reshape for LSTM training and remove invalid samples
+            x = normalize_features(x, variable='inputs')
+            x, y = reshape_data(x, y, self.seq_length)
+
+            # convert arrays to torch tensors
+            x = torch.from_numpy(x.astype(np.float32))
+            y = torch.from_numpy(y.astype(np.float32))
+            x = x.data[-1:, :, :]
+            y = y.data[-1]
+            all_member["yr" + f"{i+1}".zfill(2) if yr != hp_range[-1].year else "yref"] = x, y
+        return all_member
 
 
 class CamelsH5(Dataset):

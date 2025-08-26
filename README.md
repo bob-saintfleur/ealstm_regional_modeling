@@ -1,3 +1,57 @@
+# NOTE on this Forked project from Kratert et al. (2019)
+This is a fork of the [ealstm models](git@github.com:kratzert/ealstm_regional_modeling.git) of Kratzert et al. (2019) 
+which was published alongside this [paper](https://www.hydrol-earth-syst-sci.net/23/5089/2019/hess-23-5089-2019.html). 
+
+The models was used in the present work only under an evaluation mode for two forecasting approaches. The related findings 
+are tied to a paper submitted recently for reviewing. The few lines that was added in this original code, in order to get it adapted to the
+needs of our experiments are highlighted in the code. The indications to re-run our experiments are provided right below. 
+
+For any usage of this LSTM code, credits remain belong first to Kratzert et al. (2019).
+
+If you are discovering the original ealstm code, please jump to the original instructions below the *End of our changes* section (See below), or checkout the original paper first, then come back here.
+
+Before you jump into our changes, make sure the CAMELS data as required in the original paper, including the runs provided are downloaded on your system, since our experiments are based upon them.
+
+## Starting point of our changes
+
+Evaluate the LSTM for the whole 1989-2008 period. We have added an argument "evaluate_test" which runs this. The evaluation will concern all models found in models_box,
+if you want for only a group of models, just move those you chose into a specific folder, then call it. You are keep safe the original outputs of the models, since the evaluate_test will overwrite them
+
+```
+python main.py evaluate_test --camels_root path/to/CAMELS --models_box path/to/runs
+```
+
+e.g.:
+
+```
+python main.py evaluate_test --camels_root Y:\bobs\datapaper\camels_us --models_box  Y:\repo_egu24\outputs\test_lstm_runs
+```
+
+Evaluate the models found in runs/ for the climatology mode. It requires a positive lead time (--hp), the period to evaluate (--ref_period_clim) and a number of basins (--nbv)
+The number of basins will be selected uniformly according to their NSE ranks from the original study of Kratzert et al. (2019). It is set to 56 in the present work. --nbv is omitted, it will run on all the 531 basins, and takes long time 
+
+```
+python main.py climatology --camels_root path/to/CAMELS --models_box  path/to/runs --nbv 56 --hp 7 --ref_period_clim 20060720 20080820
+```
+
+e.g.:
+```
+python main.py climatology --camels_root Y:\bobs\datapaper\camels_us --models_box  Y:\repo_egu24\outputs\test_lstm_runs --nbv 56 --hp 4 --ref_period_clim 20080720 20080820
+```
+
+
+Note that in both cases above, to evaluate on a single model, use --run_dir path/to/runs/run_??
+
+
+Since the present work is under submission, the related citation wil be available once accepted and published.
+
+## End of our changes
+
+---
+
+## START of the original README file
+
+
 # Catchment-Aware LSTMs for Regional Rainfall-Runoff Modeling
 
 Accompanying code for our HESS paper "Towards learning universal, regional, and local hydrological behaviors via machine learning applied to large-sample datasets"

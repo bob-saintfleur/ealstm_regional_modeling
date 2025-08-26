@@ -15,7 +15,7 @@ import pickle
 import random
 import sys
 from collections import defaultdict
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path, PosixPath
 from typing import Dict, List, Tuple
 
@@ -26,7 +26,7 @@ import torch.nn as nn
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-from papercode.datasets import CamelsH5, CamelsTXT
+from papercode.datasets import CamelsH5, CamelsTXT, GetClimSubset
 from papercode.datautils import (add_camels_attributes, load_attributes,
                                  rescale_features)
 from papercode.ealstm import EALSTM
@@ -35,13 +35,20 @@ from papercode.metrics import calc_nse
 from papercode.nseloss import NSELoss
 from papercode.utils import create_h5_files, get_basin_list
 
+from glob import glob
+import multiprocessing as mp
+from selectbv import select_bv_by_class
+from my_multiproc import run_parallel, dispatch_args_to_cfg
+import warnings
+warnings.filterwarnings("ignore")
+
 ###########
 # Globals #
 ###########
 
 # fixed settings for all experiments
 GLOBAL_SETTINGS = {
-    'batch_size': 256,
+    'batch_size': 256,  #320?
     'clip_norm': True,
     'clip_value': 1,
     'dropout': 0.4,
@@ -54,7 +61,10 @@ GLOBAL_SETTINGS = {
     'train_start': pd.to_datetime('01101999', format='%d%m%Y'),
     'train_end': pd.to_datetime('30092008', format='%d%m%Y'),
     'val_start': pd.to_datetime('01101989', format='%d%m%Y'),
-    'val_end': pd.to_datetime('30091999', format='%d%m%Y')
+    'val_end': pd.to_datetime('30091999', format='%d%m%Y'),
+
+    'test_start': pd.to_datetime('01102007', format='%d%m%Y'),
+    'test_end': pd.to_datetime('30092008', format='%d%m%Y')
 }
 
 # check if GPU is available
@@ -74,10 +84,21 @@ def get_args() -> Dict:
         Dictionary containing the run config.
     """
     parser = argparse.ArgumentParser()
-    parser.add_argument('mode', choices=["train", "evaluate", "eval_robustness"])
+    parser.add_argument('mode', choices=["train", "evaluate", "climatology", "evaluate_test","eval_robustness"])
     parser.add_argument('--camels_root', type=str, help="Root directory of CAMELS data set")
     parser.add_argument('--seed', type=int, required=False, help="Random seed")
     parser.add_argument('--run_dir', type=str, help="For evaluation mode. Path to run directory.")
+    parser.add_argument('--hp', type=int, required=False, help="Forecasting lead time")
+    parser.add_argument('--nproc_bv', type=int, required=False, help="Subdivide nbv into tasks")
+    parser.add_argument('--list_bv', nargs="+", required=False, help="a specific list of basins")
+    parser.add_argument('--nbv', type=int, default=None, required=False,
+                        help="Select uniformly n basins according to their ranks in Kratzert2019(all_metrics.p)")
+    parser.add_argument('--ref_period_clim', nargs="+", default=("20070801", "20080820"), required=False,
+                        metavar=("yyyymmdd", "yyyymmdd"), help="Reference one/two years period for evaluation")
+    parser.add_argument('--clim_years', nargs="+", default=(1989, 2008), required=False,
+                        metavar=("year_start", "year_end"), help="Limit years for climatology")
+    parser.add_argument('--global', type=bool, default=False, help="Eval on full period")
+    parser.add_argument('--models_box', type=str, help="For evaluation mode. Path to run directory lot.")
     parser.add_argument('--cache_data',
                         type=bool,
                         default=False,
@@ -105,8 +126,14 @@ def get_args() -> Dict:
         # generate random seed for this run
         cfg["seed"] = int(np.random.uniform(low=0, high=1e6))
 
-    if (cfg["mode"] in ["evaluate", "eval_robustness"]) and (cfg["run_dir"] is None):
-        raise ValueError("In evaluation mode a run directory (--run_dir) has to be specified")
+    if (cfg["mode"] in ["evaluate", "eval_robustness",
+                        "evaluate_test", "climatology"]) and (cfg["run_dir"] is None and cfg["models_box"] is None):
+        raise ValueError("In evaluation mode a run directory (--run_dir or --models_box) has to be specified")
+
+    # to consider a global dataset evaluation
+    if (cfg["global"] is True) and (cfg["mode"] != "train"):
+        GLOBAL_SETTINGS["test_start"] = pd.to_datetime('01011989', format='%d%m%Y')
+        GLOBAL_SETTINGS["test_end"] = pd.to_datetime('31122008', format='%d%m%Y')
 
     # combine global settings with user config
     cfg.update(GLOBAL_SETTINGS)
@@ -115,6 +142,11 @@ def get_args() -> Dict:
         # print config to terminal
         for key, val in cfg.items():
             print(f"{key}: {val}")
+
+    if cfg["mode"] != "climatology":
+        # drop un-necessary args
+        for key in ["ref_period_clim", "clim_years"]:
+            cfg.pop(key)
 
     # convert path to PosixPath object
     cfg["camels_root"] = Path(cfg["camels_root"])
@@ -148,6 +180,9 @@ def _setup_run(cfg: Dict) -> Dict:
         cfg["train_dir"].mkdir(parents=True)
         cfg["val_dir"] = cfg["run_dir"] / 'data' / 'val'
         cfg["val_dir"].mkdir(parents=True)
+
+        cfg["test_dir"] = cfg["run_dir"] / 'data' / 'test'
+        cfg["test_dir"].mkdir(parents=True)
     else:
         raise RuntimeError(f"There is already a folder at {cfg['run_dir']}")
 
@@ -155,7 +190,7 @@ def _setup_run(cfg: Dict) -> Dict:
     with (cfg["run_dir"] / 'cfg.json').open('w') as fp:
         temp_cfg = {}
         for key, val in cfg.items():
-            if isinstance(val, PosixPath):
+            if isinstance(val, Path):  # replaced PosixPath by Path
                 temp_cfg[key] = str(val)
             elif isinstance(val, pd.Timestamp):
                 temp_cfg[key] = val.strftime(format="%d%m%Y")
@@ -203,7 +238,7 @@ def _prepare_data(cfg: Dict, basins: List) -> Dict:
 
 
 class Model(nn.Module):
-    """Wrapper class that connects LSTM/EA-LSTM with fully connceted layer"""
+    """Wrapper class that connects LSTM/EA-LSTM with fully connected layer"""
 
     def __init__(self,
                  input_size_dyn: int,
@@ -374,7 +409,7 @@ def train_epoch(model: nn.Module, optimizer: torch.optim.Optimizer, loss_func: n
     epoch : int
         Current Number of epoch
     use_mse : bool
-        If True, loss_func is nn.MSELoss(), else NSELoss() which expects addtional std of discharge
+        If True, loss_func is nn.MSELoss(), else NSELoss() which expects additional std of discharge
         vector
 
     """
@@ -431,14 +466,20 @@ def evaluate(user_cfg: Dict):
         Dictionary containing the user entered evaluation config
         
     """
-    with open(user_cfg["run_dir"] / 'cfg.json', 'r') as fp:
+    with open(user_cfg["run_dir"] + '/cfg.json', 'r') as fp:
         run_cfg = json.load(fp)
 
-    basins = get_basin_list()
-
+    # basins = get_basin_list()
+    if user_cfg["list_bv"]:
+        basins = user_cfg["list_bv"]
+    elif user_cfg["nbv"] is not None:
+        basins = select_bv_by_class(size=user_cfg["nbv"])
+    else:
+        basins = get_basin_list()
+    basins.sort()
     # get attribute means/stds
-    db_path = str(user_cfg["run_dir"] / "attributes.db")
-    attributes = load_attributes(db_path=db_path, 
+    db_path = str(user_cfg["run_dir"] + "/attributes.db")
+    attributes = load_attributes(db_path=db_path,
                                  basins=basins,
                                  drop_lat_lon=True)
     means = attributes.mean()
@@ -455,7 +496,7 @@ def evaluate(user_cfg: Dict):
                   no_static=run_cfg["no_static"]).to(DEVICE)
 
     # load trained model
-    weight_file = user_cfg["run_dir"] / 'model_epoch30.pt'
+    weight_file = user_cfg["run_dir"] + '/model_epoch30.pt'
     model.load_state_dict(torch.load(weight_file, map_location=DEVICE))
 
     date_range = pd.date_range(start=GLOBAL_SETTINGS["val_start"], end=GLOBAL_SETTINGS["val_end"])
@@ -480,6 +521,188 @@ def evaluate(user_cfg: Dict):
         results[basin] = df
 
     _store_results(user_cfg, run_cfg, results)
+
+
+def make_ref_dates(ref_date: tuple[str, str], format_="%Y%m%d"):
+    """Ge all dates of the evaluation period as a reference (t0) date"""
+    list_ref_date = pd.date_range(start=pd.to_datetime(ref_date[0], format=format_),
+                               end=pd.to_datetime(ref_date[1], format=format_), freq='D')
+    list_ref_date = [a.strftime("%Y%m%d") for a in list_ref_date if a.strftime("%m%d") != "0229"]
+    list_ref_date.sort()
+    return list_ref_date
+
+
+def climatology(user_cfg: Dict):
+    """Apply/Evaluate the model under the climatology mode.
+
+    Parameters
+    ----------
+    user_cfg : Dict
+        Dictionary containing the user entered evaluation config
+
+    """
+    with open(rf'{user_cfg["run_dir"]}/cfg.json', 'r') as fp:
+        run_cfg = json.load(fp)
+
+    # basins = get_basin_list()[:2]
+    if user_cfg["list_bv"]:
+        basins = user_cfg["list_bv"]
+    elif user_cfg["nbv"] is not None:
+        basins = select_bv_by_class(size=user_cfg["nbv"])
+    else:
+        basins = get_basin_list()
+    basins.sort()
+
+    # # get attribute means/stds
+    db_path = str(user_cfg["run_dir"] + "/attributes.db")
+    attributes = load_attributes(db_path=db_path,
+                                 basins=basins,
+                                 drop_lat_lon=True)
+    means = attributes.mean()
+    stds = attributes.std()
+
+    # create model
+    input_size_stat = 0 if run_cfg["no_static"] else 27
+    input_size_dyn = 5 if (run_cfg["no_static"] or not run_cfg["concat_static"]) else 32
+    model = Model(input_size_dyn=input_size_dyn,
+                  input_size_stat=input_size_stat,
+                  hidden_size=run_cfg["hidden_size"],
+                  dropout=run_cfg["dropout"],
+                  concat_static=run_cfg["concat_static"],
+                  no_static=run_cfg["no_static"]).to(DEVICE)
+
+    # load trained model
+    weight_file = user_cfg["run_dir"] + '/model_epoch30.pt'
+    model.load_state_dict(torch.load(weight_file, map_location=DEVICE))
+
+    date_range = pd.date_range(start=GLOBAL_SETTINGS["val_start"], end=GLOBAL_SETTINGS["val_end"])
+    if (user_cfg["mode"] == "climatology") & (user_cfg["hp"] > 0):
+        date_range = pd.date_range(start=GLOBAL_SETTINGS["val_start"],
+                                   end=pd.to_datetime(GLOBAL_SETTINGS["val_end"]) + timedelta(days=user_cfg["hp"]))
+    results = {}
+
+    for basin in tqdm(basins):
+        list_ref = enumerate(make_ref_dates(user_cfg["ref_period_clim"], format_="%Y%m%d"))
+        ref_per={}
+        for ref, ref_date in list_ref:
+            all_clim_ = GetClimSubset(camels_root=user_cfg["camels_root"],
+                                      basin=basin,
+                                      dates=[GLOBAL_SETTINGS["val_start"], GLOBAL_SETTINGS["val_end"]],
+                                      is_train=False,
+                                      is_clim=True,
+                                      ref_date=ref_date,
+                                      hp=user_cfg["hp"],
+                                      seq_length=run_cfg["seq_length"],
+                                      with_attributes=True,
+                                      attribute_means=means,
+                                      attribute_stds=stds,
+                                      concat_static=run_cfg["concat_static"],
+                                      db_path=db_path)
+            all_clim = all_clim_.clim_data
+            date_range = all_clim_.full_range
+            # Every scenario is considered in one shot
+            all_clim = dict(sorted(all_clim.items()))
+            ds_x = torch.cat([a[0] for a in all_clim.values()], dim=0)
+            ds_y = torch.cat([a[1] for a in all_clim.values()], dim=0)
+
+            ds_test = CamelsTXT(camels_root=user_cfg["camels_root"],
+                                basin=basin,
+                                dates=[GLOBAL_SETTINGS["val_start"], GLOBAL_SETTINGS["val_end"]],
+                                is_train=False,
+                                seq_length=run_cfg["seq_length"],
+                                with_attributes=True,
+                                attribute_means=means,
+                                attribute_stds=stds,
+                                concat_static=run_cfg["concat_static"],
+                                db_path=db_path,
+                                preset_xy_tensor=(ds_x, ds_y))
+
+            loader = DataLoader(ds_test, batch_size=1, shuffle=False, num_workers=1)
+            pred, obs = evaluate_basin(model, loader)
+            pred = np.array(pred).T
+            df = pd.DataFrame(pred, index=date_range[-1:])
+            df.columns = list(all_clim.keys())
+            df.insert(loc=0, column='y_obs', value=obs[-1])
+            df.index.name = "Date"
+            ref_per[ref] = df
+
+        results[basin] = pd.concat([b for a, b in ref_per.items()], axis=0)
+
+    if user_cfg["nproc_bv"]:
+        return user_cfg, run_cfg, results, f'hp{user_cfg["hp"]}'
+    else:
+        _store_results(user_cfg, run_cfg, results, f'hp{user_cfg["hp"]}')
+
+
+# I have added this evaluate_test
+def evaluate_test(user_cfg: Dict):
+    """Evaluate the model, rather the same as the evaluate mode.
+
+    Parameters
+    ----------
+    user_cfg : Dict
+        Dictionary containing the user entered evaluation config
+        
+    """
+    with open(user_cfg["run_dir"] + '/cfg.json', 'r') as fp:
+        run_cfg = json.load(fp)
+
+    # basins = get_basin_list()
+    if user_cfg["list_bv"]:
+        basins = user_cfg["list_bv"]
+    elif user_cfg["nbv"] is not None:
+        basins = select_bv_by_class(size=user_cfg["nbv"])
+    else:
+        basins = get_basin_list()
+
+    # get attribute means/stds
+    db_path = str(user_cfg["run_dir"] + "/attributes.db")
+    attributes = load_attributes(db_path=db_path,
+                                 basins=basins,
+                                 drop_lat_lon=True)
+    means = attributes.mean()
+    stds = attributes.std()
+
+    # create model
+    input_size_stat = 0 if run_cfg["no_static"] else 27
+    input_size_dyn = 5 if (run_cfg["no_static"] or not run_cfg["concat_static"]) else 32
+    model = Model(input_size_dyn=input_size_dyn,
+                  input_size_stat=input_size_stat,
+                  hidden_size=run_cfg["hidden_size"],
+                  dropout=run_cfg["dropout"],
+                  concat_static=run_cfg["concat_static"],
+                  no_static=run_cfg["no_static"]).to(DEVICE)
+
+    # load trained model
+    weight_file = user_cfg["run_dir"] + '/model_epoch30.pt'
+    model.load_state_dict(torch.load(weight_file, map_location=DEVICE))
+
+    date_range = pd.date_range(start=GLOBAL_SETTINGS["test_start"], end=GLOBAL_SETTINGS["test_end"])
+    results = {}
+    for basin in tqdm(basins):
+        ds_test = CamelsTXT(camels_root=user_cfg["camels_root"],
+                            basin=basin,
+                            dates=[GLOBAL_SETTINGS["test_start"], GLOBAL_SETTINGS["test_end"]],
+                            is_train=False,
+                            seq_length=run_cfg["seq_length"],
+                            with_attributes=True,
+                            attribute_means=means,
+                            attribute_stds=stds,
+                            concat_static=run_cfg["concat_static"],
+                            db_path=db_path)
+        loader = DataLoader(ds_test, batch_size=1024, shuffle=False, num_workers=4)
+
+        preds, obs = evaluate_basin(model, loader)
+
+        df = pd.DataFrame(data={'qobs': obs.flatten(), 'qsim': preds.flatten()}, index=date_range)
+
+        results[basin] = df
+
+    # _store_results(user_cfg, run_cfg, results)
+    if user_cfg["nproc_bv"]:
+        return user_cfg, run_cfg, results
+    else:
+        _store_results(user_cfg, run_cfg, results)
 
 
 def evaluate_basin(model: nn.Module, loader: DataLoader) -> Tuple[np.ndarray, np.ndarray]:
@@ -564,7 +787,7 @@ def eval_robustness(user_cfg: Dict):
 
     # get attribute means/stds
     db_path = str(user_cfg["run_dir"] / "attributes.db")
-    attributes = load_attributes(db_path=db_path, 
+    attributes = load_attributes(db_path=db_path,
                                  basins=basins,
                                  drop_lat_lon=True)
     means = attributes.mean()
@@ -599,7 +822,7 @@ def eval_robustness(user_cfg: Dict):
                 noise = torch.from_numpy(noise).to(DEVICE)
                 nse = eval_with_added_noise(model, loader, noise)
                 basin_results[scale].append(nse)
-                pbar.set_postfix_str(f"Basin progress: {step}/{(len(scales)-1)*n_repetitions+1}")
+                pbar.set_postfix_str(f"Basin progress: {step}/{(len(scales) - 1) * n_repetitions + 1}")
                 step += 1
 
         overall_results[basin] = basin_results
@@ -654,7 +877,7 @@ def eval_with_added_noise(model: torch.nn.Module, loader: DataLoader, noise: tor
         return nse
 
 
-def _store_results(user_cfg: Dict, run_cfg: Dict, results: pd.DataFrame):
+def _store_results(user_cfg: Dict, run_cfg: Dict, results: pd.DataFrame or Dict, discr: str = None):
     """Store results in a pickle file.
 
     Parameters
@@ -663,24 +886,66 @@ def _store_results(user_cfg: Dict, run_cfg: Dict, results: pd.DataFrame):
         Dictionary containing the user entered evaluation config
     run_cfg : Dict
         Dictionary containing the run config loaded from the cfg.json file
-    results : pd.DataFrame
-        DataFrame containing the observed and predicted discharge.
-
+    results : Dict
+        Dictionary containing the predicted discharge with basins as keys.
     """
+    discr_ = f"_{discr}" if discr is not None else ""
     if run_cfg["no_static"]:
-        file_name = user_cfg["run_dir"] / f"lstm_no_static_seed{run_cfg['seed']}.p"
+        file_name = user_cfg["run_dir"] + f"/lstm_no_static_seed{run_cfg['seed']}{discr_}.p"
     else:
         if run_cfg["concat_static"]:
-            file_name = user_cfg["run_dir"] / f"lstm_seed{run_cfg['seed']}.p"
+            file_name = user_cfg["run_dir"] + f"/lstm_seed{run_cfg['seed']}{discr_}.p"
         else:
-            file_name = user_cfg["run_dir"] / f"ealstm_seed{run_cfg['seed']}.p"
-
-    with (file_name).open('wb') as fp:
+            file_name = user_cfg["run_dir"] + f"/ealstm_seed{run_cfg['seed']}{discr_}.p"
+    with open(file_name, 'wb') as fp:
         pickle.dump(results, fp)
+    print(f"Successfully store results at {file_name}")
 
-    print(f"Sucessfully store results at {file_name}")
+
+def get_basin_list_by_args(u_cfg: Dict):
+    """
+
+    Parameters
+    ----------
+    u_cfg
+
+    Returns
+    -------
+
+    """
+    if u_cfg["list_bv"]:
+        basins = u_cfg["list_bv"]
+    elif u_cfg["nbv"] is not None:
+        basins = select_bv_by_class(size=u_cfg["nbv"])
+    else:
+        basins = get_basin_list()
+    return basins
 
 
 if __name__ == "__main__":
-    config = get_args()
-    globals()[config["mode"]](config)
+    mp.set_start_method('spawn')  # spawn or forkserver
+    config_0 = get_args()
+    list_md_cfg = []
+    if config_0["models_box"]:
+        config_x = config_0.copy()
+        for r_d in glob(rf'{config_x["models_box"]}/run_*seed*'):
+            temp_cfg = config_x.copy()
+            temp_cfg["run_dir"] = r_d
+            list_md_cfg.append(temp_cfg)
+            del temp_cfg
+    else:
+        config_0["run_dir"] = str(config_0["run_dir"])
+        list_md_cfg = [config_0]
+        print(config_0["run_dir"])
+    for config_z in list_md_cfg:
+        if config_z["nproc_bv"]:
+            basins_l = get_basin_list_by_args(config_z)
+            list_cfg = dispatch_args_to_cfg(config_z, "list_bv", basins_l, "nproc_bv")
+            run_parallel(globals()[config_z["mode"]], list_cfg)
+        else:
+            # list_cfg = [config_z]
+            # run_parallel(globals()[config_z["mode"]], list_cfg)
+            globals()[config_z["mode"]](config_z)
+
+    # config = get_args()
+    # globals()[config["mode"]](config)

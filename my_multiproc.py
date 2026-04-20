@@ -1,20 +1,17 @@
-# !/bin/env python3
+#!/bin/env python3
 
 import multiprocessing as mp
-import os
-from typing import Dict, List, Tuple
+from typing import Dict, List
 import pickle
 import queue
 import time
-from glob import glob
 import pandas as pd
-# import psutil
 
 SENTINEL = None
 
 
 def do_work(pending_task, completed_task):
-    """ use args and function and run as task while controling the flow"""
+    """ use args and function and run as task while controlling the flow"""
     # Get the current workers' name
     worker_name = mp.current_process().name
     worker_task = None
@@ -42,14 +39,11 @@ def do_work(pending_task, completed_task):
 def par_proc(job_list, num_cpus=None):
     """ Perform a parallel processing of running task using a list of task"""
     # Get the number of cores
-
     if not num_cpus:
         num_cpus = mp.cpu_count() - 4
-        # num_cpus = psutil.cpu_count(logical=False)
     # set up queues and I/O files from servers
     pending_task = mp.Queue()
     completed_task = mp.Queue()
-
     processes, results = [], []
 
     # task pointer
@@ -131,17 +125,15 @@ def store_multiproc_results(user_cfg: Dict, run_cfg: Dict, results: pd.DataFrame
     discr_ = f"_{discr}" if discr is not None else ""
 
     if run_cfg["no_static"]:
-        file_name = user_cfg["run_dir"] + f"/lstm_no_static_seed{run_cfg['seed']}{discr_}.p"
+        file_name = str(user_cfg["run_dir"]) + f"/lstm_no_static_seed{run_cfg['seed']}{discr_}.p"
     else:
         if run_cfg["concat_static"]:
-            file_name = user_cfg["run_dir"] + f"/lstm_seed{run_cfg['seed']}{discr_}.p"
+            file_name = str(user_cfg["run_dir"]) + f"/lstm_seed{run_cfg['seed']}{discr_}.p"
         else:
-            file_name = user_cfg["run_dir"] + f"/ealstm_seed{run_cfg['seed']}{discr_}.p"
-
+            file_name = str(user_cfg["run_dir"]) + f"/ealstm_seed{run_cfg['seed']}{discr_}.p"
     with open(file_name, 'wb') as fp:
         pickle.dump(results, fp)
-
-    print(f"Sucessfully store results at {file_name}")
+    print(f"Successfully store results at {file_name}")
 
 
 def run_parallel(func_, list_cfg: List[Dict]):
@@ -157,6 +149,3 @@ def run_parallel(func_, list_cfg: List[Dict]):
         res = results[sub_][mode_][2]
         all_results.update(res)
     store_multiproc_results(user_cfg, run_cfg, all_results, discr_)
-
-
-

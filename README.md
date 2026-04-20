@@ -2,48 +2,79 @@
 This is a fork of the [ealstm models](git@github.com:kratzert/ealstm_regional_modeling.git) of Kratzert et al. (2019) 
 which was published alongside this [paper](https://www.hydrol-earth-syst-sci.net/23/5089/2019/hess-23-5089-2019.html). 
 
-The models was used in the present work only under an evaluation mode for two forecasting approaches. The related findings 
-are tied to a paper submitted recently for reviewing. The few lines that was added in this original code, in order to get it adapted to the
-needs of our experiments are highlighted in the code. The indications to re-run our experiments are provided right below. 
+The models were used in the present work only under an evaluation mode. These evaluation modes are declined as "hindcast"
+and "climatology", and ensemble-based. The related findings are tied to above paper submitted recently for reviewing. 
+The few lines that was added in this original code, in order to get it adapted to the needs of our experiments can be 
+highlighted through versions comparison. The indications to re-run our experiments are provided right below. Note that 
+for any usage of this LSTM code, credits remain belong first to Kratzert et al. (2019).
 
-For any usage of this LSTM code, credits remain belong first to Kratzert et al. (2019).
-
-If you are discovering the original ealstm code, please jump to the original instructions below the *End of our changes* section (See below), or checkout the original paper first, then come back here.
-
-Before you jump into our changes, make sure the CAMELS data as required in the original paper, including the runs provided are downloaded on your system, since our experiments are based upon them.
+If you are discovering the original ealstm code, please jump to the original instructions below the *End of our changes* 
+section (See below), or checkout the original paper first, then come back. Before you jump into our changes, make sure 
+the CAMELS data as required in the original paper, including the runs provided are downloaded on your system, since our
+experiments are based upon them.
 
 ## Starting point of our changes
+The considered evaluation period used for the above paper ranges from 1989-10-01 to 1991-09-30 in a yyyy-mm-dd format.
+The lead times range from 1 to 7 days.
+The hindcast ensemble-based evaluation requires hindcast archives for each basin within the concerned period, including 
+the covered lead times. The related data are in the **hindcast** sub folder provided in the data repo.
+The climatology ensemble-based evaluation is based on the forcing records provided in the CAMELS dataset itself.
 
-Evaluate the LSTM for the whole 1989-2008 period. We have added an argument "evaluate_test" which runs this. The evaluation will concern all models found in models_box,
-if you want for only a group of models, just move those you chose into a specific folder, then call it. You are keep safe the original outputs of the models, since the evaluate_test will overwrite them
-
+## 1. Main command line structure 
 ```
-python main.py evaluate_test --camels_root path/to/CAMELS --models_box path/to/runs
+python main.py mode --camels_root path/to/CAMELS --models_box path/to/runs --basins_file name_of_basins_list_file --hp value --ref_period_clim start_date end_date
+```
+This will perform evaluation on the models found in **path\to\runs** for the **mode**. It requires a positive lead time 
+(e.g. --hp 1), the period to evaluate (e.g. --ref_period_clim 19901001 19901030 ). Data are expected from *path/to/CAMELS* 
+as it will found sub-folders such as _basin_mean_forcing/_, _usgs_streamflow/_, _camels_attributes_v2.0/_ , as disposed 
+in the original CAMELS dataset structure. The number of basins will to be used is passed using the basins_file argument
+and a file_name.
+
+Note : Parallelization on sub-periods can be done using * --nproc_bv value * where value is an integer between 2 and 20
+
+## 2. Example
+You may need to clone this the code first
+
+````
+git clone https://github.com/bob-saintfleur/ealstm_regional_modeling.git -b hydro_uge
+````
+
+You may also need to set up a proper environment if you don't intend to use uv, see original paper steps for environment setting
+
+### 2.1.  Launch with uv
+
+- Climatology
+```
+uv run python main.py climatology --camels_root data/CAMELS --models_box path/to/runs --basins_file basins_test --hp 1 --ref_period_clim 19901001 19901030 --nproc_bv 3
 ```
 
-e.g.:
-
+- Hindcast
 ```
-python main.py evaluate_test --camels_root Y:\bobs\datapaper\camels_us --models_box  Y:\repo_egu24\outputs\test_lstm_runs
-```
-
-Evaluate the models found in runs/ for the climatology mode. It requires a positive lead time (--hp), the period to evaluate (--ref_period_clim) and a number of basins (--nbv)
-The number of basins will be selected uniformly according to their NSE ranks from the original study of Kratzert et al. (2019). It is set to 56 in the present work. --nbv is omitted, it will run on all the 531 basins, and takes long time 
-
-```
-python main.py climatology --camels_root path/to/CAMELS --models_box  path/to/runs --nbv 56 --hp 7 --ref_period_clim 20060720 20080820
+uv run python main.py hindcast --camels_root data/CAMELS --models_box path/to/runs --basins_file basins_test --hp 1 --ref_period_clim 19901001 19901030 --nproc_bv 3
 ```
 
-e.g.:
+### 2.2. Launch from a cmd line IDE such as pycharm
+
+- Climatology
 ```
-python main.py climatology --camels_root Y:\bobs\datapaper\camels_us --models_box  Y:\repo_egu24\outputs\test_lstm_runs --nbv 56 --hp 4 --ref_period_clim 20080720 20080820
+python main.py climatology --camels_root data/CAMELS --models_box path/to/runs --basins_file basins_test --hp 1 --ref_period_clim 19901001 19901030 --nproc_bv 3
 ```
 
+- Hindcast
+```
+python main.py hindcast --camels_root data/CAMELS --models_box path/to/runs --basins_file basins_test --hp 1 --ref_period_clim 19901001 19901030 --nproc_bv 3
+```
 
-Note that in both cases above, to evaluate on a single model, use --run_dir path/to/runs/run_??
+## 3. Output files
+The output files are saved like
+ - path/to/runs/run_xxxx/*seedSSS_clim_hpX.p for climatology runs, see the **clim** string
+ - path/to/runs/run_xxxx/*seedSSS_hcst_hpX.p for hindcast runs, see the **hcst** string
 
+From that point, only postprocessing remains.
 
-Since the present work is under submission, the related citation wil be available once accepted and published.
+## 4. Notes
+Note that the regional lstm runs are dropped in the  **data_paper\runs\lstm_ws_us** sub folder. They concern only LSTM 
+trained with static inputs and the MSE loss function. These experiments can also be implemented for all the remain runs.
 
 ## End of our changes
 

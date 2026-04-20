@@ -1,0 +1,23 @@
+[project]
+name = "ealstm-vhydro-uge"
+version = "0.1.0"
+description = "Ensemble-based evaluation of the regional LSTM (Krazert et al., 2019), see neuralhydrology for original details. This version is related to the preprint (https://doi.org/10.5194/egusphere-2025-4244)."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "matplotlib",
+    "numba",
+    "numpy",
+    "pandas",
+    "ruamel.yaml",
+    "torch",
+    "scipy",
+    "tensorboard",
+    "tqdm",
+    "xarray",
+    "netcdf4",
+    "h5py"
+]
+authors = [
+    {name = "Bob E. SAINT-FLEUR", email = "besaintfleur@gmail.com"}
+]

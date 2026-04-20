@@ -9,6 +9,8 @@ You should have received a copy of the Apache-2.0 license along with the code. I
 see <https://opensource.org/licenses/Apache-2.0>
 """
 
+import torch
+import torch.nn as nn
 import argparse
 import json
 import pickle
@@ -18,14 +20,13 @@ from collections import defaultdict
 from datetime import datetime, timedelta
 from pathlib import Path, PosixPath
 from typing import Dict, List, Tuple
-
+from selectbv import select_bv_by_class
+from my_multiproc import run_parallel, dispatch_args_to_cfg
+import glob
 import numpy as np
 import pandas as pd
-import torch
-import torch.nn as nn
 from torch.utils.data import DataLoader
 from tqdm import tqdm
-
 from papercode.datasets import CamelsH5, CamelsTXT, GetClimSubset
 from papercode.datautils import (add_camels_attributes, load_attributes,
                                  rescale_features)
@@ -35,20 +36,13 @@ from papercode.metrics import calc_nse
 from papercode.nseloss import NSELoss
 from papercode.utils import create_h5_files, get_basin_list
 
-from glob import glob
-import multiprocessing as mp
-from selectbv import select_bv_by_class
-from my_multiproc import run_parallel, dispatch_args_to_cfg
-import warnings
-warnings.filterwarnings("ignore")
-
 ###########
 # Globals #
 ###########
 
 # fixed settings for all experiments
 GLOBAL_SETTINGS = {
-    'batch_size': 256,  #320?
+    'batch_size': 320,
     'clip_norm': True,
     'clip_value': 1,
     'dropout': 0.4,
@@ -58,11 +52,10 @@ GLOBAL_SETTINGS = {
     'log_interval': 50,
     'learning_rate': 1e-3,
     'seq_length': 270,
-    'train_start': pd.to_datetime('01101999', format='%d%m%Y'),
-    'train_end': pd.to_datetime('30092008', format='%d%m%Y'),
-    'val_start': pd.to_datetime('01101989', format='%d%m%Y'),
-    'val_end': pd.to_datetime('30091999', format='%d%m%Y'),
-
+    'train_start': pd.to_datetime('01101996', format='%d%m%Y'),  # ex 1999
+    'train_end': pd.to_datetime('30092007', format='%d%m%Y'),  # 2008
+    'val_start': pd.to_datetime('01091996', format='%d%m%Y'),  # 1989
+    'val_end': pd.to_datetime('30091996', format='%d%m%Y'),  # 1999
     'test_start': pd.to_datetime('01102007', format='%d%m%Y'),
     'test_end': pd.to_datetime('30092008', format='%d%m%Y')
 }
@@ -84,20 +77,23 @@ def get_args() -> Dict:
         Dictionary containing the run config.
     """
     parser = argparse.ArgumentParser()
-    parser.add_argument('mode', choices=["train", "evaluate", "climatology", "evaluate_test","eval_robustness"])
+    parser.add_argument('mode', choices=["train", "evaluate", "climatology", "evaluate_test", 'hindcast',
+                                         "eval_robustness"])
     parser.add_argument('--camels_root', type=str, help="Root directory of CAMELS data set")
+    parser.add_argument('--device', type=str, default="cpu", help="Device to target")
     parser.add_argument('--seed', type=int, required=False, help="Random seed")
-    parser.add_argument('--run_dir', type=str, help="For evaluation mode. Path to run directory.")
     parser.add_argument('--hp', type=int, required=False, help="Forecasting lead time")
-    parser.add_argument('--nproc_bv', type=int, required=False, help="Subdivide nbv into tasks")
+    parser.add_argument('--nproc_bv', type=int, default=1, required=False, help="Subdivide nbv into tasks")
+    parser.add_argument('--basins_file', type=str, required=False, help="a specific file of basins")
     parser.add_argument('--list_bv', nargs="+", required=False, help="a specific list of basins")
     parser.add_argument('--nbv', type=int, default=None, required=False,
-                        help="Select uniformly n basins according to their ranks in Kratzert2019(all_metrics.p)")
+                        help="Select uniformly n basins according to their NSE rank in Kratzert et al. (2019)")
     parser.add_argument('--ref_period_clim', nargs="+", default=("20070801", "20080820"), required=False,
                         metavar=("yyyymmdd", "yyyymmdd"), help="Reference one/two years period for evaluation")
     parser.add_argument('--clim_years', nargs="+", default=(1989, 2008), required=False,
-                        metavar=("year_start", "year_end"), help="Limit years for climatology")
+                        metavar=("lower_year", "upper_year"), help="Limit years for climatology")
     parser.add_argument('--global', type=bool, default=False, help="Eval on full period")
+    parser.add_argument('--run_dir', type=str, help="For evaluation mode. Path to run directory.")
     parser.add_argument('--models_box', type=str, help="For evaluation mode. Path to run directory lot.")
     parser.add_argument('--cache_data',
                         type=bool,
@@ -120,33 +116,32 @@ def get_args() -> Dict:
                         default=False,
                         help="If True, uses mean squared error as loss function.")
     cfg = vars(parser.parse_args())
+    if cfg["basins_file"] is not None:
+        list_bv = [a.split()[0] for a in open(str(Path(cfg["camels_root"]).parent)+"/"+cfg["basins_file"]).readlines()]
+        cfg.update({"list_bv":list_bv})
 
     # Validation checks
     if (cfg["mode"] == "train") and (cfg["seed"] is None):
         # generate random seed for this run
         cfg["seed"] = int(np.random.uniform(low=0, high=1e6))
 
-    if (cfg["mode"] in ["evaluate", "eval_robustness",
-                        "evaluate_test", "climatology"]) and (cfg["run_dir"] is None and cfg["models_box"] is None):
-        raise ValueError("In evaluation mode a run directory (--run_dir or --models_box) has to be specified")
-
-    # to consider a global dataset evaluation
-    if (cfg["global"] is True) and (cfg["mode"] != "train"):
-        GLOBAL_SETTINGS["test_start"] = pd.to_datetime('01011989', format='%d%m%Y')
-        GLOBAL_SETTINGS["test_end"] = pd.to_datetime('31122008', format='%d%m%Y')
+    if cfg["mode"] != "train" and cfg["run_dir"] is None and cfg["models_box"] is None:
+        raise ValueError("In evaluation mode a run directory (--run_dir) has to be specified")
 
     # combine global settings with user config
     cfg.update(GLOBAL_SETTINGS)
+
+    # I have added the following to consider a global evaluation
+    if (cfg["global"] is True) and (cfg["mode"] != "train"):
+        cfg["test_start"] = pd.to_datetime('01011980', format='%d%m%Y')
+        cfg["test_end"] = pd.to_datetime('31122014', format='%d%m%Y')
+        GLOBAL_SETTINGS["test_start"] = pd.to_datetime('01011980', format='%d%m%Y')
+        GLOBAL_SETTINGS["test_end"] = pd.to_datetime('31122014', format='%d%m%Y')
 
     if cfg["mode"] == "train":
         # print config to terminal
         for key, val in cfg.items():
             print(f"{key}: {val}")
-
-    if cfg["mode"] != "climatology":
-        # drop un-necessary args
-        for key in ["ref_period_clim", "clim_years"]:
-            cfg.pop(key)
 
     # convert path to PosixPath object
     cfg["camels_root"] = Path(cfg["camels_root"])
@@ -157,7 +152,6 @@ def get_args() -> Dict:
 
 def _setup_run(cfg: Dict) -> Dict:
     """Create folder structure for this run
-
     Parameters
     ----------
     cfg : dict
@@ -190,7 +184,7 @@ def _setup_run(cfg: Dict) -> Dict:
     with (cfg["run_dir"] / 'cfg.json').open('w') as fp:
         temp_cfg = {}
         for key, val in cfg.items():
-            if isinstance(val, Path):  # replaced PosixPath by Path
+            if isinstance(val, Path):  # i replaced PosixPath by Path
                 temp_cfg[key] = str(val)
             elif isinstance(val, pd.Timestamp):
                 temp_cfg[key] = val.strftime(format="%d%m%Y")
@@ -228,7 +222,6 @@ def _prepare_data(cfg: Dict, basins: List) -> Dict:
                     dates=[cfg["train_start"], cfg["train_end"]],
                     with_basin_str=True,
                     seq_length=cfg["seq_length"])
-
     return cfg
 
 
@@ -464,21 +457,15 @@ def evaluate(user_cfg: Dict):
     ----------
     user_cfg : Dict
         Dictionary containing the user entered evaluation config
-        
+
     """
-    with open(user_cfg["run_dir"] + '/cfg.json', 'r') as fp:
+    with open(user_cfg["run_dir"] / 'cfg.json', 'r') as fp:
         run_cfg = json.load(fp)
 
-    # basins = get_basin_list()
-    if user_cfg["list_bv"]:
-        basins = user_cfg["list_bv"]
-    elif user_cfg["nbv"] is not None:
-        basins = select_bv_by_class(size=user_cfg["nbv"])
-    else:
-        basins = get_basin_list()
-    basins.sort()
+    basins = get_basin_list()
+    basins.sort()  # FIXME: added to control sth on July18th
     # get attribute means/stds
-    db_path = str(user_cfg["run_dir"] + "/attributes.db")
+    db_path = str(user_cfg["run_dir"] / "attributes.db")
     attributes = load_attributes(db_path=db_path,
                                  basins=basins,
                                  drop_lat_lon=True)
@@ -496,7 +483,7 @@ def evaluate(user_cfg: Dict):
                   no_static=run_cfg["no_static"]).to(DEVICE)
 
     # load trained model
-    weight_file = user_cfg["run_dir"] + '/model_epoch30.pt'
+    weight_file = user_cfg["run_dir"] / 'model_epoch30.pt'
     model.load_state_dict(torch.load(weight_file, map_location=DEVICE))
 
     date_range = pd.date_range(start=GLOBAL_SETTINGS["val_start"], end=GLOBAL_SETTINGS["val_end"])
@@ -513,7 +500,6 @@ def evaluate(user_cfg: Dict):
                             concat_static=run_cfg["concat_static"],
                             db_path=db_path)
         loader = DataLoader(ds_test, batch_size=1024, shuffle=False, num_workers=4)
-
         preds, obs = evaluate_basin(model, loader)
 
         df = pd.DataFrame(data={'qobs': obs.flatten(), 'qsim': preds.flatten()}, index=date_range)
@@ -523,38 +509,30 @@ def evaluate(user_cfg: Dict):
     _store_results(user_cfg, run_cfg, results)
 
 
-def make_ref_dates(ref_date: tuple[str, str], format_="%Y%m%d"):
-    """Ge all dates of the evaluation period as a reference (t0) date"""
+def make_ref_dates(ref_date: tuple, format_="%Y%m%d"):
     list_ref_date = pd.date_range(start=pd.to_datetime(ref_date[0], format=format_),
-                               end=pd.to_datetime(ref_date[1], format=format_), freq='D')
+                                  end=pd.to_datetime(ref_date[1], format=format_), freq='D')
     list_ref_date = [a.strftime("%Y%m%d") for a in list_ref_date if a.strftime("%m%d") != "0229"]
     list_ref_date.sort()
     return list_ref_date
 
 
-def climatology(user_cfg: Dict):
-    """Apply/Evaluate the model under the climatology mode.
+def ens_run(user_cfg: Dict):
+    """Launch climatology or hindcast mode using options such as the basin, the evaluation period, the models
+    dir, the lead times.
 
     Parameters
     ----------
     user_cfg : Dict
         Dictionary containing the user entered evaluation config
-
     """
     with open(rf'{user_cfg["run_dir"]}/cfg.json', 'r') as fp:
         run_cfg = json.load(fp)
-
-    # basins = get_basin_list()[:2]
-    if user_cfg["list_bv"]:
-        basins = user_cfg["list_bv"]
-    elif user_cfg["nbv"] is not None:
-        basins = select_bv_by_class(size=user_cfg["nbv"])
-    else:
-        basins = get_basin_list()
+    basins = get_basin_list()
     basins.sort()
 
     # # get attribute means/stds
-    db_path = str(user_cfg["run_dir"] + "/attributes.db")
+    db_path = str(user_cfg["run_dir"]) + "/attributes.db"
     attributes = load_attributes(db_path=db_path,
                                  basins=basins,
                                  drop_lat_lon=True)
@@ -572,39 +550,47 @@ def climatology(user_cfg: Dict):
                   no_static=run_cfg["no_static"]).to(DEVICE)
 
     # load trained model
-    weight_file = user_cfg["run_dir"] + '/model_epoch30.pt'
-    model.load_state_dict(torch.load(weight_file, map_location=DEVICE))
+    weight_file = str(user_cfg["run_dir"]) + '/model_epoch30.pt'
+    model.load_state_dict(torch.load(weight_file, weights_only=True, map_location=DEVICE))
 
-    date_range = pd.date_range(start=GLOBAL_SETTINGS["val_start"], end=GLOBAL_SETTINGS["val_end"])
-    if (user_cfg["mode"] == "climatology") & (user_cfg["hp"] > 0):
-        date_range = pd.date_range(start=GLOBAL_SETTINGS["val_start"],
-                                   end=pd.to_datetime(GLOBAL_SETTINGS["val_end"]) + timedelta(days=user_cfg["hp"]))
     results = {}
+    run_mode = user_cfg["mode"]
+    discr_mode = "hcst_" if "hind" in run_mode else 'clim_'
 
-    for basin in tqdm(basins):
-        list_ref = enumerate(make_ref_dates(user_cfg["ref_period_clim"], format_="%Y%m%d"))
-        ref_per={}
-        for ref, ref_date in list_ref:
-            all_clim_ = GetClimSubset(camels_root=user_cfg["camels_root"],
-                                      basin=basin,
-                                      dates=[GLOBAL_SETTINGS["val_start"], GLOBAL_SETTINGS["val_end"]],
-                                      is_train=False,
-                                      is_clim=True,
-                                      ref_date=ref_date,
-                                      hp=user_cfg["hp"],
-                                      seq_length=run_cfg["seq_length"],
-                                      with_attributes=True,
-                                      attribute_means=means,
-                                      attribute_stds=stds,
-                                      concat_static=run_cfg["concat_static"],
-                                      db_path=db_path)
-            all_clim = all_clim_.clim_data
-            date_range = all_clim_.full_range
+    if user_cfg["list_bv"]:
+        basins_l = user_cfg["list_bv"]
+    elif user_cfg["nbv"] is not None:
+        # basins_l = get_sub_bv_uniformly(size=user_cfg["nbv"])
+        basins_l = select_bv_by_class(size=user_cfg["nbv"])
+    else:
+        basins_l = basins
+    # for basin in tqdm(basins):
+    for basin in basins_l:
+        period = user_cfg["ref_period_clim"]
+        all_mbr_date = GetClimSubset(camels_root=user_cfg["camels_root"],
+                                     basin=basin,
+                                     dates=[GLOBAL_SETTINGS["val_start"], GLOBAL_SETTINGS["val_end"]],
+                                     is_train=False,
+                                     is_clim=True,
+                                     ref_date=period[0],
+                                     hp=user_cfg["hp"],
+                                     seq_length=run_cfg["seq_length"],
+                                     with_attributes=True,
+                                     attribute_means=means,
+                                     attribute_stds=stds,
+                                     concat_static=run_cfg["concat_static"],
+                                     period=period, run_mode=run_mode,
+                                     db_path=db_path).get_clim_dates()
+
+        out_c, ref_dt = (), ()
+        BAR_CLIM = tqdm(all_mbr_date, desc=f"{run_mode.upper()} - b: {basin}: It-Ens-Mbr-Dt", leave=False)
+        for dte, f_dt, all_clim in BAR_CLIM:
+            BAR_CLIM.set_postfix_str(f"Date: {dte}")
+
             # Every scenario is considered in one shot
             all_clim = dict(sorted(all_clim.items()))
             ds_x = torch.cat([a[0] for a in all_clim.values()], dim=0)
             ds_y = torch.cat([a[1] for a in all_clim.values()], dim=0)
-
             ds_test = CamelsTXT(camels_root=user_cfg["camels_root"],
                                 basin=basin,
                                 dates=[GLOBAL_SETTINGS["val_start"], GLOBAL_SETTINGS["val_end"]],
@@ -617,46 +603,48 @@ def climatology(user_cfg: Dict):
                                 db_path=db_path,
                                 preset_xy_tensor=(ds_x, ds_y))
 
-            loader = DataLoader(ds_test, batch_size=1, shuffle=False, num_workers=1)
+            loader = DataLoader(ds_test, batch_size=len(ds_test), shuffle=False, num_workers=1)
             pred, obs = evaluate_basin(model, loader)
-            pred = np.array(pred).T
-            df = pd.DataFrame(pred, index=date_range[-1:])
-            df.columns = list(all_clim.keys())
-            df.insert(loc=0, column='y_obs', value=obs[-1])
+            df = pd.DataFrame(np.concatenate([obs[-1:][np.newaxis], pred], axis=0).T, index=[f_dt],
+                              columns=["y_obs"] + list(all_clim.keys()))
             df.index.name = "Date"
-            ref_per[ref] = df
-
-        results[basin] = pd.concat([b for a, b in ref_per.items()], axis=0)
-
-    if user_cfg["nproc_bv"]:
-        return user_cfg, run_cfg, results, f'hp{user_cfg["hp"]}'
+            out_c += (df,)
+        out_c = pd.concat(out_c, axis=0).sort_index()
+        results[basin] = out_c
+    if user_cfg["nproc_bv"] is not None:
+        return user_cfg, run_cfg, results, f'{discr_mode}hp{user_cfg["hp"]}'
     else:
-        _store_results(user_cfg, run_cfg, results, f'hp{user_cfg["hp"]}')
+        _store_results(user_cfg, run_cfg, results, f'{discr_mode}hp{user_cfg["hp"]}')
 
 
-# I have added this evaluate_test
+def climatology(user_cfg: Dict):
+    """Run climatology"""
+    if user_cfg["mode"] == "climatology":
+        return ens_run(user_cfg=user_cfg)
+
+
+def hindcast(user_cfg: Dict):
+    """Run hindcast"""
+    if user_cfg["mode"] == "hindcast":
+        return ens_run(user_cfg=user_cfg)
+
+
 def evaluate_test(user_cfg: Dict):
-    """Evaluate the model, rather the same as the evaluate mode.
+    """Train model for a single epoch.
 
     Parameters
     ----------
     user_cfg : Dict
         Dictionary containing the user entered evaluation config
-        
+
     """
-    with open(user_cfg["run_dir"] + '/cfg.json', 'r') as fp:
+    with open(user_cfg["run_dir"] / 'cfg.json', 'r') as fp:
         run_cfg = json.load(fp)
 
-    # basins = get_basin_list()
-    if user_cfg["list_bv"]:
-        basins = user_cfg["list_bv"]
-    elif user_cfg["nbv"] is not None:
-        basins = select_bv_by_class(size=user_cfg["nbv"])
-    else:
-        basins = get_basin_list()
+    basins = get_basin_list()
 
     # get attribute means/stds
-    db_path = str(user_cfg["run_dir"] + "/attributes.db")
+    db_path = str(user_cfg["run_dir"] / "attributes.db")
     attributes = load_attributes(db_path=db_path,
                                  basins=basins,
                                  drop_lat_lon=True)
@@ -674,7 +662,7 @@ def evaluate_test(user_cfg: Dict):
                   no_static=run_cfg["no_static"]).to(DEVICE)
 
     # load trained model
-    weight_file = user_cfg["run_dir"] + '/model_epoch30.pt'
+    weight_file = user_cfg["run_dir"] / 'model_epoch30.pt'
     model.load_state_dict(torch.load(weight_file, map_location=DEVICE))
 
     date_range = pd.date_range(start=GLOBAL_SETTINGS["test_start"], end=GLOBAL_SETTINGS["test_end"])
@@ -691,11 +679,8 @@ def evaluate_test(user_cfg: Dict):
                             concat_static=run_cfg["concat_static"],
                             db_path=db_path)
         loader = DataLoader(ds_test, batch_size=1024, shuffle=False, num_workers=4)
-
         preds, obs = evaluate_basin(model, loader)
-
         df = pd.DataFrame(data={'qobs': obs.flatten(), 'qsim': preds.flatten()}, index=date_range)
-
         results[basin] = df
 
     # _store_results(user_cfg, run_cfg, results)
@@ -724,9 +709,7 @@ def evaluate_basin(model: nn.Module, loader: DataLoader) -> Tuple[np.ndarray, np
 
     """
     model.eval()
-
     preds, obs = None, None
-
     with torch.no_grad():
         for data in loader:
             if len(data) == 2:
@@ -744,12 +727,10 @@ def evaluate_basin(model: nn.Module, loader: DataLoader) -> Tuple[np.ndarray, np
             else:
                 preds = torch.cat((preds, p.detach().cpu()), 0)
                 obs = torch.cat((obs, y.detach().cpu()), 0)
-
         preds = rescale_features(preds.numpy(), variable='output')
         obs = obs.numpy()
         # set discharges < 0 to zero
         preds[preds < 0] = 0
-
     return preds, obs
 
 
@@ -759,12 +740,12 @@ def eval_robustness(user_cfg: Dict):
     In this experiment, gaussian noise with increasing scale is added to the static features to
     evaluate the model robustness against pertubations of the static catchment characteristics.
     For each scale, 50 noise vectors are drawn.
-    
+
     Parameters
     ----------
     user_cfg : Dict
         Dictionary containing the user entered evaluation config
-    
+
     Raises
     ------
     NotImplementedError
@@ -845,7 +826,7 @@ def eval_with_added_noise(model: torch.nn.Module, loader: DataLoader, noise: tor
         PyTorch DataLoader containing the basin data in batches.
     noise : torch.Tensor
         Tensor containing the noise for this evaluation run.
-    
+
     Returns
     -------
     float
@@ -891,12 +872,12 @@ def _store_results(user_cfg: Dict, run_cfg: Dict, results: pd.DataFrame or Dict,
     """
     discr_ = f"_{discr}" if discr is not None else ""
     if run_cfg["no_static"]:
-        file_name = user_cfg["run_dir"] + f"/lstm_no_static_seed{run_cfg['seed']}{discr_}.p"
+        file_name = str(user_cfg["run_dir"]) + f"/lstm_no_static_seed{run_cfg['seed']}{discr_}.p"
     else:
         if run_cfg["concat_static"]:
-            file_name = user_cfg["run_dir"] + f"/lstm_seed{run_cfg['seed']}{discr_}.p"
+            file_name = str(user_cfg["run_dir"]) + f"/lstm_seed{run_cfg['seed']}{discr_}.p"
         else:
-            file_name = user_cfg["run_dir"] + f"/ealstm_seed{run_cfg['seed']}{discr_}.p"
+            file_name = str(user_cfg["run_dir"]) + f"/ealstm_seed{run_cfg['seed']}{discr_}.p"
     with open(file_name, 'wb') as fp:
         pickle.dump(results, fp)
     print(f"Successfully store results at {file_name}")
@@ -923,29 +904,21 @@ def get_basin_list_by_args(u_cfg: Dict):
 
 
 if __name__ == "__main__":
-    mp.set_start_method('spawn')  # spawn or forkserver
-    config_0 = get_args()
-    list_md_cfg = []
-    if config_0["models_box"]:
-        config_x = config_0.copy()
-        for r_d in glob(rf'{config_x["models_box"]}/run_*seed*'):
-            temp_cfg = config_x.copy()
-            temp_cfg["run_dir"] = r_d
-            list_md_cfg.append(temp_cfg)
-            del temp_cfg
-    else:
-        config_0["run_dir"] = str(config_0["run_dir"])
-        list_md_cfg = [config_0]
-        print(config_0["run_dir"])
-    for config_z in list_md_cfg:
-        if config_z["nproc_bv"]:
-            basins_l = get_basin_list_by_args(config_z)
-            list_cfg = dispatch_args_to_cfg(config_z, "list_bv", basins_l, "nproc_bv")
-            run_parallel(globals()[config_z["mode"]], list_cfg)
-        else:
-            # list_cfg = [config_z]
-            # run_parallel(globals()[config_z["mode"]], list_cfg)
-            globals()[config_z["mode"]](config_z)
-
     # config = get_args()
     # globals()[config["mode"]](config)
+    config_0 = get_args()
+    list_md_cfg = ()
+    if config_0["models_box"]: # use a box of run_dir (or models)
+        for r_d in glob.glob(rf'{config_0["models_box"]}/run_*seed*'):
+            config_x = config_0.copy()
+            config_x["run_dir"] = r_d
+            list_md_cfg += (config_x,)
+    else:
+        list_md_cfg = [config_0]
+    for config_z in list_md_cfg:
+        if config_z["nproc_bv"] is not None:
+            basins_l = get_basin_list_by_args(config_z)
+            list_cfg = dispatch_args_to_cfg(config_z, "list_bv", basins_l, "nproc_bv")
+        else:
+            list_cfg = [config_z]
+        run_parallel(globals()[config_z["mode"]], list_cfg)

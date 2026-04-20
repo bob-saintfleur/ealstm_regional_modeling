@@ -9,7 +9,7 @@ You should have received a copy of the Apache-2.0 license along with the code. I
 see <https://opensource.org/licenses/Apache-2.0>
 """
 
-from pathlib import PosixPath
+from pathlib import PosixPath, Path
 from typing import List, Tuple, Dict
 from datetime import timedelta
 import h5py
@@ -24,7 +24,7 @@ from .datautils import (load_attributes, load_discharge, load_forcing,
 
 class CamelsTXT(Dataset):
     """PyTorch data set to work with the raw text files in the CAMELS data set.
-       
+
     Parameters
     ----------
     camels_root : PosixPath
@@ -83,14 +83,12 @@ class CamelsTXT(Dataset):
         self.period_end = None
         self.attribute_names = None
 
-        if self.preset_xy_tensor is not None:
+        if self.preset_xy_tensor is not None:  # Added in july24 to get fed with pre-set tensor data
             self.x, self.y = self.preset_xy_tensor
         else:
             self.x, self.y = self._load_data()
-
         if self.with_attributes:
             self.attributes = self._load_attributes()
-
         self.num_samples = self.x.shape[0]
 
     def __len__(self):
@@ -210,88 +208,135 @@ class GetClimSubset:
                  attribute_means: pd.Series = None,
                  attribute_stds: pd.Series = None,
                  concat_static: bool = False,
-                 db_path: str = None):
+                 db_path: str = None,
+                 period: Tuple[str, str] = ("19901001", "19901031"),
+                 run_mode: str = None,
+                 ):
         self.camels_root = camels_root
         self.basin = basin
         self.seq_length = seq_length
         self.is_train = is_train
         self.is_clim = is_clim
-        self.dates = dates
         self.with_attributes = with_attributes
         self.attribute_means = attribute_means
         self.attribute_stds = attribute_stds
         self.concat_static = concat_static
         self.db_path = db_path
         self.hp = hp
+        self.run_mode = run_mode
         self.ref_date = pd.to_datetime(ref_date)
+        self.period = period
+        self.full_range = []
 
-        # placeholder to store std of discharge, used for rescaling losses during training
-        self.q_std = None
-
-        # placeholder to store start and end date of entire period (incl warmup)
-        self.period_start = None
-        self.period_end = None
-        self.full_range = None
-        self.attribute_names = None
-
-        if self.hp is not None:
-            self.clim_data = self._load_clim_members()
-
-    def _load_clim_members(self, year_min: int = 1990, year_max: int = 2008) \
-            -> Dict[str, Tuple[torch.Tensor, torch.Tensor]]:
-        """Load input and output data from text files."""
+    def load_clim_members2(self, period: Tuple[str, str] = None, year_min: int = 1990, year_max: int = 2008) \
+            -> Tuple:
+        """Load hindcast data for ensemble evaluation."""
+        if period is None:
+            period = self.period
         df, area = load_forcing(self.camels_root, self.basin)
+        df['QObs(mm/d)'] = load_discharge(self.camels_root, self.basin, area)
+        period_ = pd.date_range(start=str(period[0]), end=str(period[1]), freq="D")
         year_min, year_max = max(df.index.year.min(), year_min), min(df.index.year.max(), year_max)
+        full_clim = ()
+        for dte_ in period_:
+            hist_range = pd.date_range(dte_, periods=self.seq_length, freq='-1D')[::-1]
+            hp_range = pd.date_range(dte_, periods=self.hp + 1, freq='D')[1:]
+            if (hp_range.strftime("%m%d") == "0229").sum() != 0:
+                hp_range = hp_range + pd.DateOffset(days=1)
+                hp_range = hp_range[hp_range.strftime("%m%d") != "0229"]
+
+            # self.full_range = hist_range.append(hp_range)
+            self.full_range.append(hp_range[-1])
+            df_hist = df.loc[hist_range]
+            all_member = {}
+            for i, yr in enumerate(range(year_min, year_max)):
+                k = yr - hp_range[0].year
+                hp_range_ = hp_range + pd.DateOffset(years=k)
+                df_mbr = df.loc[hp_range_]
+                df_mbr.index = hp_range
+                df_mbr = pd.concat([df_hist, df_mbr], axis=0)
+
+                # use all meteorological variables as inputs
+                x = np.array([
+                    df_mbr['prcp(mm/day)'].values, df_mbr['srad(W/m2)'].values, df_mbr['tmax(C)'].values,
+                    df_mbr['tmin(C)'].values, df_mbr['vp(Pa)'].values]).T
+                y = np.array([df_mbr['QObs(mm/d)'].values]).T
+
+                # normalize data, reshape for LSTM training and remove invalid samples
+                x = normalize_features(x, variable='inputs')
+                x, y = reshape_data(x, y, self.seq_length)
+
+                # convert arrays to torch tensors
+                x = torch.from_numpy(x.astype(np.float32))
+                y = torch.from_numpy(y.astype(np.float32))
+                x = x[-1:, :, :]
+                y = y[-1]
+                all_member["yr" + f"{i + 1}".zfill(2) if yr != hp_range[-1].year else "yref"] = x, y
+            full_clim += ((dte_, hp_range[-1], all_member),)
+        return full_clim
+
+    def load_hindcast_members(self, period: Tuple[str, str] = None) \
+            -> Tuple:
+        """Load hindcast data for ensemble evaluation."""
+
+        if period is None:
+            period = self.period
+        df, area = load_forcing(self.camels_root, self.basin)
         df['QObs(mm/d)'] = load_discharge(self.camels_root, self.basin, area)
 
-        # we use (seq_len) time steps before start for warmup
-        start_date = self.ref_date - pd.DateOffset(days=self.seq_length - 1)
-        end_date = self.ref_date
-        hist_range = pd.date_range(start_date, end_date, freq='D')
+        # Load Rename hindcast data to camels-style
+        df_hind = pd.read_csv(str(Path(self.camels_root).parent) + f"/hindcast/{self.basin}.csv", sep=";",
+                              index_col=["member", "time", "step", "Date"], parse_dates=["time", "Date"])
+        rename_hind_c = {'P_CM': 'prcp(mm/day)', 'RAD_CM': 'srad(W/m2)', 'T_CM_max': 'tmax(C)', 'T_CM_min': 'tmin(C)',
+                         'VP_CM': 'vp(Pa)', 'SWI_CM_swe': 'swe(mm)'}
+        df_hind = df_hind.rename(columns=rename_hind_c).drop(columns=["ETP_CM"])
 
-        # we use (hp) time steps after the ref date
-        start_date_hp = self.ref_date + timedelta(days=1)
-        end_date_hp = start_date_hp + timedelta(days=self.hp - 1)
-        hp_range = pd.date_range(start_date_hp, end_date_hp, freq='D')
+        # Only use intersection index, since hindcast are barely time-continuous
+        period_ = pd.date_range(start=str(period[0]), end=str(period[1]), freq="D")
+        period_ = period_.intersection(df_hind.index.get_level_values("time").unique())
+        full_hindcast = ()
+        # Process date by date from hindcast 'time'
+        for dte_ in period_:
+            hist_range = pd.date_range(dte_, periods=self.seq_length, freq='-1D')[::-1]
+            hp_range = pd.date_range(dte_, periods=self.hp + 1, freq='D')[1:]
 
-        if (hp_range.strftime("%m%d") == "0229").sum() != 0:
-            hp_range = hp_range + pd.DateOffset(days=1)
-            hp_range = hp_range[hp_range.strftime("%m%d") != "0229"]
+            hist_df = df.loc[hist_range]
+            df_hind_mbr = df_hind.xs(dte_, level="time")
+            base_hp = df.loc[hp_range]
+            all_member = {}
+            for mbx, df_m in df_hind_mbr.groupby("member"):
+                df_i = df_m.droplevel(["member", "step"]).loc[hp_range]
+                base_hp[df_i.columns] = df_i
+                df_mbr = pd.concat([hist_df.loc[hist_range], base_hp], axis=0)[self.hp:]
 
-        self.full_range = hist_range.append(hp_range)
+                # use all meteorological variables as inputs
+                x = np.array([
+                    df_mbr['prcp(mm/day)'].values, df_mbr['srad(W/m2)'].values, df_mbr['tmax(C)'].values,
+                    df_mbr['tmin(C)'].values, df_mbr['vp(Pa)'].values]).T
+                y = np.array([df_mbr['QObs(mm/d)'].values]).T
 
-        df_hist = df.loc[hist_range, :]
-        df_hp_ref = df.loc[hp_range,:]
+                # normalize data, reshape for LSTM training and remove invalid samples
+                x = normalize_features(x, variable='inputs')
+                x, y = reshape_data(x, y, self.seq_length)
 
-        self.period_start = start_date
-        self.period_end = end_date_hp
+                # convert arrays to torch tensors
+                x = torch.from_numpy(x.astype(np.float32))
+                y = torch.from_numpy(y.astype(np.float32))
+                x = x[-1:, :, :]
+                y = y[-1]
+                all_member["m" + f"{mbx}".zfill(2)] = x, y
+            full_hindcast += ((dte_, hp_range[-1], all_member),)
+        return full_hindcast
 
-        all_member = {}
-
-        for i, yr in enumerate(range(year_min, year_max)):
-            k = yr - hp_range[0].year
-            hp_range_ = hp_range + pd.DateOffset(years=k)
-            df_mbr = df.loc[hp_range_]
-            df_mbr.index = hp_range
-            df_mbr = pd.concat([df_hist, df_mbr], axis=0)
-
-            # use all meteorological variables as inputs
-            x = np.array([
-                df_mbr['prcp(mm/day)'].values, df_mbr['srad(W/m2)'].values, df_mbr['tmax(C)'].values,
-                df_mbr['tmin(C)'].values, df_mbr['vp(Pa)'].values]).T
-            y = np.array([df_mbr['QObs(mm/d)'].values]).T
-
-            # normalize data, reshape for LSTM training and remove invalid samples
-            x = normalize_features(x, variable='inputs')
-            x, y = reshape_data(x, y, self.seq_length)
-
-            # convert arrays to torch tensors
-            x = torch.from_numpy(x.astype(np.float32))
-            y = torch.from_numpy(y.astype(np.float32))
-            x = x.data[-1:, :, :]
-            y = y.data[-1]
-            all_member["yr" + f"{i+1}".zfill(2) if yr != hp_range[-1].year else "yref"] = x, y
-        return all_member
+    def get_clim_dates(self, period: tuple = None):
+        if period is None:
+            period = self.period
+        if self.run_mode.startswith("hindc"):
+            return self.load_hindcast_members(period=period)
+        elif self.run_mode.startswith("climato"):
+            return self.load_clim_members2(period=period)
+        else:
+            return ()
 
 
 class CamelsH5(Dataset):

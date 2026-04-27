@@ -88,7 +88,8 @@ These outputs need to be reformatted from *seedSSS_clim_hpX.p to:
    - context="lstm"
    - basin: 8-digit string ID of basin
    - hp: integer of lead time
-   - seed: integer of the number of the seed from 1 to 10 in the ensemble cases, and -1 in the case of the deterministic case
+   - seed: integer of the number of the seeds [1 to N]
+   - year: Number of the member [1 to M], and -1 in the case of the deterministic (perfect) case
    - Date: yyyy-mm-dd date format
    - FILE: 
      - climatology : `lstm_hp[1-7]_CLIM56.parquet.gzip`

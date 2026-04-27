@@ -76,11 +76,11 @@ From that point, only postprocessing remains.
 
 ### 4.1. Runs from provided
 For simplicity, you can use directly the post-processed files found in the fub folder `data_paper/processed/us/`
-If you need to re-run from scratch, you will need the section 4.2. below
+If you need to re-run from scratch, you will need the `section 4.2. below`
 
 ## 4.2. Post-process your runs 
 
-These outputs need to be reformatted from *seedSSS_clim_hpX.p to:
+These outputs need to be reformatted from `*seedSSS_clim_hpX.p` to:
  - 1. A Date indexed one-file-per-basin-per-hp with mean on seed. Save in `data/hindcast_bm/lstm/hp[1-7]/basin.csv`, 
    or `data/climato_bm/lstm/hp[1-7]/basin.csv`.
  - 2. A multi index dataframe with One-file-per-hp for all basin, where multi-index should be `(context, basin, hp, year, seed, Date)` and the column will be `(prediction)`. 
@@ -99,6 +99,10 @@ These outputs need to be reformatted from *seedSSS_clim_hpX.p to:
 
 
 [Note] The MLP runs use the `hindcast_bm/lstm/hp[1-7]/basin.csv` to perform the DA2 and the DA3 strategies
+
+# 7. Plots
+To explore the graphics, you should refer to the [MLP_UGE](https://gitlab.univ-eiffel.fr/bob.saint-fleur/ai_operational_hydroforecast.git) code and its readme.
+
 
 ## 6. Notes
 Note that the regional lstm runs are dropped in the  `data_paper/runs/lstm_mse_with_static_us` sub folder. They concern only LSTM 

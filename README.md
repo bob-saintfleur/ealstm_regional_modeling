@@ -67,23 +67,23 @@ python main.py hindcast --camels_root data/CAMELS --models_box path/to/runs --ba
 
 ## 3. Output files
 The output files are saved like
- - path/to/runs/run_xxxx/*seedSSS_clim_hpX.p for climatology runs, see the **clim** string
- - path/to/runs/run_xxxx/*seedSSS_hcst_hpX.p for hindcast runs, see the **hcst** string
+ - `path/to/runs/run_xxxx/*seedSSS_clim_hp[1-7].p` for climatology runs, see the **clim** string
+ - `path/to/runs/run_xxxx/*seedSSS_hcst_hp[1-7].p` for hindcast runs, see the **hcst** string
 
 From that point, only postprocessing remains.
 
 ## 4. Post-process runs
 
 ### 4.1. Runs from provided
-For simplicity, you can use directly the post-processed files found in the fub folder **data_paper/processed/us/**
+For simplicity, you can use directly the post-processed files found in the fub folder `data_paper/processed/us/`
 If you need to re-run from scratch, you will need the section 4.2. below
 
 ## 4.2. Post-process your runs 
 
 These outputs need to be reformatted from *seedSSS_clim_hpX.p to:
- - 1. A Date indexed one-file-per-basin-per-hp with mean on seed. Save in data/hindcast_bm/lstm/hp[1-7]/basin.csv, 
-   or data/climato_bm/lstm/hp[1-7]/basin.csv.
- - 2. A multi index dataframe with One-file-per-hp for all basin, where multi-index should be (context, basin, hp, year, seed, Date) and the column will be (prediction). 
+ - 1. A Date indexed one-file-per-basin-per-hp with mean on seed. Save in `data/hindcast_bm/lstm/hp[1-7]/basin.csv`, 
+   or `data/climato_bm/lstm/hp[1-7]/basin.csv`.
+ - 2. A multi index dataframe with One-file-per-hp for all basin, where multi-index should be `(context, basin, hp, year, seed, Date)` and the column will be `(prediction)`. 
     And saved it in a FILE.parquet.gzip for faster processing, with:
    - context="lstm"
    - basin: 8-digit string ID of basin
@@ -91,16 +91,16 @@ These outputs need to be reformatted from *seedSSS_clim_hpX.p to:
    - seed: integer of the number of the seed from 1 to 10 in the ensemble cases, and -1 in the case of the deterministic case
    - Date: yyyy-mm-dd date format
    - FILE: 
-     - climatology : lstm_hp[1-7]_CLIM56.parquet.gzip
-     - hindcast: lstm_hp[1-7]_HIND56.parquet.gzip
-     - perfect or deterministic: lstm_hp[1-7]_PERF531.parquet.gzip
-   - save like in : ~/data_paper/processed/us/FILE.parquet.gzip 
+     - climatology : `lstm_hp[1-7]_CLIM56.parquet.gzip`
+     - hindcast: `lstm_hp[1-7]_HIND56.parquet.gzip`
+     - perfect or deterministic: `lstm_hp[1-7]_PERF531.parquet.gzip`
+   - save like in : `~/data_paper/processed/us/FILE.parquet.gzip` 
 
 
-[Note] The MLP runs use the "hindcast_bm/lstm/hp[1-7]/basin.csv" to perform the DA2 and the DA3 strategies
+[Note] The MLP runs use the `hindcast_bm/lstm/hp[1-7]/basin.csv` to perform the DA2 and the DA3 strategies
 
 ## 6. Notes
-Note that the regional lstm runs are dropped in the  **data_paper\runs\lstm_mse_with_static_us** sub folder. They concern only LSTM 
+Note that the regional lstm runs are dropped in the  `data_paper/runs/lstm_mse_with_static_us` sub folder. They concern only LSTM 
 trained with static inputs and the MSE loss function. These experiments can also be implemented for all the remain runs.
 
 ## End of our changes
